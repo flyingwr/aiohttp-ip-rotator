@@ -1,20 +1,14 @@
-from aiohttp import ClientSession
-from aiohttp import ClientResponse
-from random import choice
-from random import randint
-from struct import pack
-from socket import inet_ntoa
-from typing import Union
-from typing import Optional
 from aiobotocore.client import BaseClient
-from botocore.exceptions import ClientError
-from botocore.exceptions import EndpointConnectionError
 from aioboto3.session import Session
-from asyncio import sleep
-from asyncio import gather
-from asyncio import create_task
+from aiohttp import ClientResponse, ClientSession
+from botocore.exceptions import ClientError, EndpointConnectionError
+from random import choice, randint
+from socket import inet_ntoa
+from struct import pack
+from typing import Optional, Union
 from uuid import uuid4
 
+import asyncio
 
 class RotatingClientSession(ClientSession):
     def __init__(
@@ -24,6 +18,7 @@ class RotatingClientSession(ClientSession):
         key_secret: Optional[str] = None,
         host_header: Optional[str] = None,
         verbose: bool = False,
+        wait_all_regions: bool = True,
         *args,
         **kwargs
     ):
@@ -35,6 +30,7 @@ class RotatingClientSession(ClientSession):
         self.key_secret = key_secret
         self.host_header = host_header or self.target.split("://", 1)[1].split("/", 1)[0]
         self.verbose = verbose
+        self.wait_all_regions = wait_all_regions
         self.endpoints = []
         self.name = f"IP Rotator for {self.target} ({str(uuid4())})"
         self.active = False
@@ -48,7 +44,13 @@ class RotatingClientSession(ClientSession):
         ]
 
     async def __aenter__(self):
-        await self.start()
+        task = asyncio.create_task(self.start())
+        if self.wait_all_regions:
+            await task
+        else:        
+            while not self.active:
+                await asyncio.sleep(0)
+
         return self
 
     async def __aexit__(self, *args, **kwargs):
@@ -171,20 +173,29 @@ class RotatingClientSession(ClientSession):
                     except ClientError as e:
                         if e.response["Error"]["Code"] == "TooManyRequestsException":
                             self._print_if_verbose("Too many requests when deleting rest API, sleeping for 3 seconds")
-                            await sleep(3)
+                            await asyncio.sleep(3)
                             return await self._clear_region_apis(region)
                     self._print_if_verbose(f"Deleted rest API with id \"{api['id']}\"")
 
     async def _clear_apis(self) -> None:
-        await gather(*[create_task(self._clear_region_apis(region)) for region in self.regions])
+        await asyncio.gather(*[asyncio.create_task(self._clear_region_apis(region)) for region in self.regions])
         self._print_if_verbose(f"All created APIs for ip rotating have been deleted")
 
     async def start(self) -> None:
         self._print_if_verbose(f"Starting IP Rotating APIs in {len(self.regions)} regions")
-        endpoints = await gather(*[create_task(self._create_api(region)) for region in self.regions])
-        self.endpoints.extend([endpoint for endpoint in endpoints if endpoint is not None])
+
+        for task in asyncio.as_completed(
+            asyncio.create_task(self._create_api(region)) for region in self.regions
+        ):
+            endpoint = await task
+            if endpoint is not None:
+                self.endpoints.append(endpoint)
+
+                if not self.active:
+                    self.active = True
+                    self._print_if_verbose(f"First API setup: {endpoint}")
+
         self._print_if_verbose(f"API launched in {len(self.endpoints)} regions out of {len(self.regions)}")
-        self.active = True
 
     def request(self, method: str, url: str, **kwargs) -> ClientResponse:
         if len(self.endpoints) == 0:
