@@ -156,7 +156,15 @@ class RotatingClientSession(ClientSession):
 
                 api_id = (await client.create_rest_api(name=self.name,
                                                        endpointConfiguration={"types": ["REGIONAL"]}))["id"]
-            except (ClientError, EndpointConnectionError):
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "TooManyRequestsException":
+                    self._print_if_verbose("Too many requests when creating rest API, sleeping for 3 seconds")
+                    await asyncio.sleep(3)
+                    return await self._create_api(region, force)
+
+                self._print_if_verbose(f"Could not create new API in region \"{region}\"")
+                return None
+            except EndpointConnectionError:
                 self._print_if_verbose(f"Could not create new API in region \"{region}\"")
                 return None
             api_resource_id = (await client.get_resources(restApiId=api_id))["items"][0]["id"]
