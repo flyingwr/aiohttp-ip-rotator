@@ -138,7 +138,7 @@ class RotatingClientSession(ClientSession):
             stageName="proxy-stage"
         )
 
-    async def _create_api(self, region: str) -> Optional[str]:
+    async def _create_api(self, region: str, force: bool = False) -> Optional[str]:
         async with Session().client(
                 "apigateway",
                 region_name=region,
@@ -146,6 +146,12 @@ class RotatingClientSession(ClientSession):
                 aws_secret_access_key=self.key_secret
         ) as client:
             try:
+                if not force:
+                    current_apis = await self._get_apis(region, client)
+                    for api in current_apis:
+                        if api.get("name", "").startswith(self.name):
+                            return f"{api['id']}.execute-api.{region}.amazonaws.com"
+
                 api_id = (await client.create_rest_api(name=self.name,
                                                        endpointConfiguration={"types": ["REGIONAL"]}))["id"]
             except (ClientError, EndpointConnectionError):
@@ -181,11 +187,11 @@ class RotatingClientSession(ClientSession):
         await asyncio.gather(*[asyncio.create_task(self._clear_region_apis(region)) for region in self.regions])
         self._print_if_verbose(f"All created APIs for ip rotating have been deleted")
 
-    async def start(self) -> None:
+    async def start(self, force: bool = False) -> None:
         self._print_if_verbose(f"Starting IP Rotating APIs in {len(self.regions)} regions")
 
         for task in asyncio.as_completed(
-            asyncio.create_task(self._create_api(region)) for region in self.regions
+            [asyncio.create_task(self._create_api(region, force)) for region in self.regions]
         ):
             endpoint = await task
             if endpoint is not None:
