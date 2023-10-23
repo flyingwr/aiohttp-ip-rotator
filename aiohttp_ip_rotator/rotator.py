@@ -6,7 +6,6 @@ from random import choice, randint
 from socket import inet_ntoa
 from struct import pack
 from typing import Optional, Union
-from uuid import uuid4
 
 import asyncio
 
@@ -17,6 +16,7 @@ class RotatingClientSession(ClientSession):
         key_id: Optional[str] = None,
         key_secret: Optional[str] = None,
         host_header: Optional[str] = None,
+        clear_all: bool = False,
         verbose: bool = False,
         wait_all_regions: bool = True,
         *args,
@@ -29,10 +29,11 @@ class RotatingClientSession(ClientSession):
         self.key_id = key_id
         self.key_secret = key_secret
         self.host_header = host_header or self.target.split("://", 1)[1].split("/", 1)[0]
+        self.clear_all = clear_all
         self.verbose = verbose
         self.wait_all_regions = wait_all_regions
         self.endpoints = []
-        self.name = f"IP Rotator for {self.target} ({str(uuid4())})"
+        self.name = f"IP Rotator for {self.target}"
         self.active = False
         self.regions = [
             "us-east-1", "us-east-2", "us-west-1", "us-west-2",
@@ -150,6 +151,7 @@ class RotatingClientSession(ClientSession):
                     current_apis = await self._get_apis(region, client)
                     for api in current_apis:
                         if api.get("name", "").startswith(self.name):
+                            self._print_if_verbose(f"Found existing API for region \"{region}\"")
                             return f"{api['id']}.execute-api.{region}.amazonaws.com"
 
                 api_id = (await client.create_rest_api(name=self.name,
@@ -165,7 +167,7 @@ class RotatingClientSession(ClientSession):
             self._print_if_verbose(f"Created API with id \"{api_id}\"")
             return f"{api_id}.execute-api.{region}.amazonaws.com"
 
-    async def _clear_region_apis(self, region: str) -> None:
+    async def _clear_region_apis(self, region: str, force: bool = False) -> None:
         async with Session().client(
                 "apigateway",
                 region_name=region,
@@ -173,18 +175,18 @@ class RotatingClientSession(ClientSession):
                 aws_secret_access_key=self.key_secret
         ) as client:
             for api in await self._get_apis(region, client):
-                if api["name"] == self.name:
+                if force or api["name"] == self.name:
                     try:
                         await client.delete_rest_api(restApiId=api["id"])
                     except ClientError as e:
                         if e.response["Error"]["Code"] == "TooManyRequestsException":
                             self._print_if_verbose("Too many requests when deleting rest API, sleeping for 3 seconds")
                             await asyncio.sleep(3)
-                            return await self._clear_region_apis(region)
+                            return await self._clear_region_apis(region, force)
                     self._print_if_verbose(f"Deleted rest API with id \"{api['id']}\"")
 
     async def _clear_apis(self) -> None:
-        await asyncio.gather(*[asyncio.create_task(self._clear_region_apis(region)) for region in self.regions])
+        await asyncio.gather(*[asyncio.create_task(self._clear_region_apis(region, self.clear_all)) for region in self.regions])
         self._print_if_verbose(f"All created APIs for ip rotating have been deleted")
 
     async def start(self, force: bool = False) -> None:
